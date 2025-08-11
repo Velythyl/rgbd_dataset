@@ -15,17 +15,18 @@ FRAME_WIDTH = 1920
 FRAME_HEIGHT = 1440
 DEPTH_WIDTH = 256
 DEPTH_HEIGHT = 192
-MAX_DEPTH = 4.5 # noqa unused, left as a note to the user
+MAX_DEPTH = 4.5  # noqa unused, left as a note to the user
+
 
 class StrayScannerRGBD(RGBD):
     def __init__(
-        self,
-        rgb_video_file: str = "rgb.mp4",
-        pose_file: str = "odometry.csv",
-        intrinsics_file: str = "camera_matrix.csv",
-        strayscanner_depth_confidence: int = 1, # 0,1,2
-        rotate_180: bool = True,
-        **kwargs,
+            self,
+            rgb_video_file: str = "rgb.mp4",
+            pose_file: str = "odometry.csv",
+            intrinsics_file: str = "camera_matrix.csv",
+            strayscanner_depth_confidence: int = 1,  # 0,1,2
+            rotate: int = 180,  # 90, 180, or 270 degrees
+            **kwargs,
     ):
         """
         StrayScanner dataset loader (inheriting from RGBD but reading its own format).
@@ -34,7 +35,12 @@ class StrayScannerRGBD(RGBD):
         self.intrinsics_file = intrinsics_file
         self.rgb_video_file = rgb_video_file
         self.strayscanner_depth_confidence = strayscanner_depth_confidence
-        self.rotate_180 = rotate_180
+        assert rotate in [0, 90, 180, 270, -90], "Rotation must be 0, -90, 90, 180, or 270 degrees"
+        if rotate == -90:
+            rotate = 270
+        if rotate in [90,270]:
+            raise NotImplementedError("Weird behaviour; fixme")
+        self.rotate = rotate
         self.kwargs = kwargs
         super().__init__(**kwargs)
 
@@ -44,7 +50,7 @@ class StrayScannerRGBD(RGBD):
             "pose_file": self.pose_file,
             "intrinsics_file": self.intrinsics_file,
             "strayscanner_depth_confidence": self.strayscanner_depth_confidence,
-            "rotate_180": self.rotate_180,
+            "rotate": self.rotate,
             **self.kwargs,
         }
 
@@ -99,8 +105,12 @@ class StrayScannerRGBD(RGBD):
             depth = np.array(Image.open(os.path.join(RAW_DEPTH_PATH, filename)))
             depth[confidence < self.strayscanner_depth_confidence] = 0
             depth = resize_depth(depth)
-            if self.rotate_180:
+            if self.rotate == 90:
+                depth = cv2.rotate(depth, cv2.ROTATE_90_CLOCKWISE)
+            elif self.rotate == 180:
                 depth = cv2.rotate(depth, cv2.ROTATE_180)
+            elif self.rotate == 270:
+                depth = cv2.rotate(depth, cv2.ROTATE_90_COUNTERCLOCKWISE)
             cv2.imwrite(os.path.join(DEPTH_PATH, f'{number}.png'), depth)
 
         self.save_cache_sentinel(DEPTH_PATH)
@@ -128,8 +138,12 @@ class StrayScannerRGBD(RGBD):
                     break
 
                 frame = cv2.resize(frame, (self.resized_width, self.resized_height))
-                if self.rotate_180:
+                if self.rotate == 90:
+                    frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+                elif self.rotate == 180:
                     frame = cv2.rotate(frame, cv2.ROTATE_180)
+                elif self.rotate == 270:
+                    frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
                 frame_path = os.path.join(str(RGB_PATH), f"{i:06}.jpg")
                 params = [int(cv2.IMWRITE_JPEG_QUALITY), 90]
                 cv2.imwrite(frame_path, frame, params)
@@ -156,12 +170,25 @@ class StrayScannerRGBD(RGBD):
         cx = matrix[0, 2]
         cy = matrix[1, 2]
         matrix = np.array([[fx, 0.0, cx],
-                         [0., fy, cy],
-                         [0., 0., 1.0]])
+                           [0., fy, cy],
+                           [0., 0., 1.0]])
 
-        if self.rotate_180:
+        if self.rotate == 180:
             matrix[0, 2] = FRAME_WIDTH - matrix[0, 2]  # new cx
             matrix[1, 2] = FRAME_HEIGHT - matrix[1, 2]  # new cy
+        elif self.rotate == 90:
+            # Swap fx/fy and cx/cy after rotation
+            matrix = np.array([
+                [fy, 0, cy],
+                [0, fx, FRAME_WIDTH - cx],
+                [0, 0, 1]
+            ])
+        elif self.rotate == 270:
+            matrix = np.array([
+                [fy, 0, FRAME_HEIGHT - cy],
+                [0, fx, cx],
+                [0, 0, 1]
+            ])
 
         # StrayScanner has 1 set of intrinsics; RGBD expects one per frame
         n_frames = len(self.get_rgb_paths())
@@ -183,7 +210,21 @@ class StrayScannerRGBD(RGBD):
             position = line[2:5]
             quaternion = line[5:]
             T_WC = np.eye(4)
-            T_WC[:3, :3] = R.from_quat(quaternion).as_matrix() @ (np.eye(3) if not self.rotate_180 else np.array([[-1, 0, 0], [0, -1, 0], [0, 0, 1]]))
+            rot_matrix = R.from_quat(quaternion).as_matrix()
+
+            def get_rot_mat(angle):
+                R_z = R.from_euler('z', angle).as_matrix()
+                return R_z
+
+            # Apply rotation based on the selected degree
+            if self.rotate == 90:
+                rot_matrix = rot_matrix @ get_rot_mat(np.pi / 2)
+            elif self.rotate == 180:
+                rot_matrix = rot_matrix @ np.array([[-1, 0, 0], [0, -1, 0], [0, 0, 1]])
+            elif self.rotate == 270:
+                rot_matrix = rot_matrix @ get_rot_mat(-np.pi / 2)
+
+            T_WC[:3, :3] = rot_matrix
             T_WC[:3, 3] = position
             poses.append(T_WC)
         return poses
